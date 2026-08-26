@@ -1,0 +1,5 @@
+# Common Lisp runtime and native libraries used by cl-art on macOS.
+brew "sbcl"
+brew "sdl2-compat"
+brew "sdl2_image"
+brew "sdl2_ttf"

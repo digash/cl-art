@@ -1,0 +1,51 @@
+#+title: cl-art Architecture
+
+* Boundary
+
+=cl-art= owns the application, its Guix package, every ART-specific Common
+Lisp package repair, its tests, and its macOS dependency manifest.  A consumer
+repository should only select the =cl-art= channel/package and bind the =art=
+command to host-specific keys.
+
+The channel deliberately keeps its modules below =modules/=; the
+=.guix-channel= metadata makes that directory the channel's package search
+root.  The public package is =(cl-art packages art) cl-art=.  The repaired Lisp
+packages and input rewriter live in =(cl-art packages lisp)=, so they cannot
+silently replace Guix packages used by unrelated applications.
+
+* Runtime shape
+
+The initial package preserves the already-tested script runtime.  It propagates
+SBCL and the complete rewritten Common Lisp closure so the script can discover
+Guix's prebuilt ASDF systems through the active profile.  This is intentional
+for the extraction release: moving ownership and redesigning the executable at
+the same time would make failures difficult to attribute.
+
+The direct Lisp systems are CFFI, Dexador, QURI, SDL2, SDL2-image, SDL2-ttf,
+and Shasht.  The channel also owns the c2ffi build input, the libffi include
+repair, and the SDL TTF header compatibility repair.
+
+On macOS the same command uses SBCL, Quicklisp, and native SDL libraries.  The
+=macos/Brewfile= declares SBCL and the native libraries.  =macos/bootstrap=
+preserves an existing Quicklisp setup and pre-loads the six ART systems.  If
+Quicklisp is absent, installation requires an explicit local quickstart file
+and an independently verified SHA-256; the repository does not embed an
+unverified installer or download one implicitly.
+
+Only SDL ownership moves out of guix-sync after the command, formulae,
+Quicklisp setup, and systems are ready.  SBCL is also used elsewhere and remains
+in guix-sync's managed set.  Check mode first requires Quicklisp's local
+=QL-DIST:INSTALLEDP= metadata and then uses =ASDF:FIND-SYSTEM= and
+=ASDF:LOAD-SYSTEM= rather than =QL:QUICKLOAD=, so checking cannot download a
+missing release.
+
+* Reproducibility
+
+=ci/channels.scm= pins the Guix revision against which both supported Linux
+architectures must build.  A consumer separately pins an authenticated cl-art
+channel commit.  Release tags never move, and the package version follows the
+=VERSION= file.
+
+Modified package derivations are not expected in public substitute caches.
+Local native builds are the baseline.  A Guix publish service may cache builds
+later, but archive signing is separate from Git channel authentication.

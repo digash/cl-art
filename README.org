@@ -1,0 +1,96 @@
+#+title: cl-art
+
+=cl-art= fetches public-domain works from the Art Institute of Chicago and
+shows one still image per display.  This repository is also a GNU Guix channel:
+it owns the application package, its full Common Lisp dependency closure, and
+the package repairs needed by the SDL bindings.
+
+* Layout
+
+- =bin/art=: portable SBCL command.
+- =modules/cl-art/packages/art.scm=: public =cl-art= Guix package.
+- =modules/cl-art/packages/lisp.scm=: ART-specific package variants and closure.
+- =guix.scm=: local package entry point.
+- =ci/channels.scm=: pinned Guix revision for validation.
+- =macos/=: native dependency manifest and safe ownership handoff.
+- =tests/=: package-boundary and bootstrap regression checks.
+
+* Local Guix validation
+
+#+begin_src bash
+ci_root=$(mktemp -d)
+guix pull -C ci/channels.scm -p "$ci_root/guix"
+"$ci_root/guix/bin/guix" build -L modules -f guix.scm
+"$ci_root/guix/bin/guix" lint -n -L modules cl-art
+guix repl -L modules -L . -- tests/package.scm
+#+end_src
+
+The Guix pin is an authenticated root snapshot, so it must be bootstrapped into
+an isolated profile with =guix pull=.  It intentionally cannot be used with
+=guix time-machine=, which requires ancestry predating Guix's historical
+time-machine boundary.
+
+The lint run is network-free and includes the license checker.
+
+Run the build natively on both x86_64-linux and aarch64-linux.  Public Guix
+substitute servers will not normally have the repaired derivations.
+
+* macOS
+
+Do not run guix-sync concurrently with the handoff.
+
+#+begin_src bash
+bash macos/bootstrap
+bash macos/bootstrap --check
+#+end_src
+
+The bootstrap installs =bin/art= at =~/.local/bin/art=, installs SBCL and the
+native SDL libraries from the Brewfile, ensures =~/quicklisp/setup.lisp= exists,
+and pre-loads Dexador, Shasht, QURI, SDL2, SDL2-image, and SDL2-ttf.  Existing
+Quicklisp installations are reused and never replaced or updated.
+
+A fresh Quicklisp install is deliberately not trust-on-first-use.  This
+repository has no independently verified checksum for the upstream quickstart
+file, so supply both a trusted local installer and its expected SHA-256:
+
+#+begin_src bash
+CL_ART_QUICKLISP_INSTALLER=/path/to/quicklisp.lisp \
+CL_ART_QUICKLISP_INSTALLER_SHA256=verified-64-hex-digit-sha256 \
+  bash macos/bootstrap
+#+end_src
+
+The installer is rejected before SBCL runs if its checksum differs.  An
+incomplete, non-empty =~/quicklisp= directory is also left untouched for manual
+inspection rather than overwritten.
+
+Only the three SDL formulae transfer out of guix-sync's current and legacy
+=brew-managed= state.  SBCL is shared infrastructure and remains in that state.
+The handoff first verifies every formula and all six Quicklisp systems, makes
+one-time =.before-cl-art= backups, and replaces state atomically.  Use
+=--adopt-only= when Homebrew is already correct or =--dry-run= to inspect the
+handoff.  =--check= loads the already-installed systems through ASDF and never
+calls Quicklisp's downloader.
+
+=CL_ART_QUICKLISP_HOME=, =CL_ART_SBCL=, =CL_ART_BIN_DIR=, and
+=XDG_STATE_HOME= provide explicit path overrides.  They also let
+=tests/macos-bootstrap.bash= exercise fresh-install and check paths entirely
+offline with fake Brew and SBCL commands.  When Quicklisp lives outside its
+default =~/quicklisp= directory, keep =CL_ART_QUICKLISP_HOME= set when running
+=art= as well as when running the bootstrap.
+
+* Publishing as a channel
+
+=.guix-channel= exposes the =modules/= directory and names the orphan =keyring=
+branch that carries the armored signing key.  =.guix-authorizations= authorizes
+the complete signing fingerprint.  The introductory commit is immutable and
+must be recorded in every consumer; see =docs/release-and-cutover.org= before
+adding the channel to one.
+
+Consumer configurations should pin an immutable cl-art commit and include a
+channel introduction.  They should install only the =cl-art= package; direct
+Lisp and SDL dependencies belong here, not in consumer Home configurations.
+
+* License
+
+Copyright (c) 2026 dig@gashinsky.com.  Distributed under the MIT License; see
+=LICENSE=.

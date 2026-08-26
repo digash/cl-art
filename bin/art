@@ -1,0 +1,607 @@
+#!/usr/bin/env -S sbcl --dynamic-space-size 4096 --script
+;; -*- mode: lisp -*-
+;;;; Copyright (c) 2026 dig@gashinsky.com
+;;;;
+;;;; Author: dig@gashinsky.com
+;;;;
+;;;; Public-domain art, fetched and shown. `art fetch' fills ART_DIR from the Art
+;;;; Institute of Chicago; `art show' puts a still on every display until a key is
+;;;; pressed or the mouse moves. Both halves live here because they share ART_DIR,
+;;;; the artist list and the image walk, and one file is one thing to install.
+;;;;
+;;;; Nothing in SHOW animates. That is the requirement, not a preference: drifting
+;;;; art causes motion sickness. It is also why none of the ready-made routes
+;;;; worked. Apple's Photos saver answers "No Photos" even with a populated
+;;;; library -- it wants a TCC grant it cannot prompt for while running as a saver,
+;;;; and its source picker is the pane MDM greys out. The other ten built-in savers
+;;;; are generative or text. XScreenSaver's GLSlideshow does show the images but
+;;;; pans and zooms them, and duration/pan/zoom/fade are absent from its resource
+;;;; table -- only .imageDirectory is there, which is why pointing it at a folder
+;;;; worked and turning the motion off did not.
+;;;;
+;;;; SDL rather than a browser because of the displays: 3456x2234 built-in,
+;;;; 5120x2880, and a 2880x5120 rotated into portrait. Chrome's --kiosk fullscreens
+;;;; one window on one screen; SDL enumerates them and takes them all, rotation
+;;;; included, with nothing per-display to configure.
+;;;;
+;;;; SBCL rather than ciel: ciel is for small scripts, and this one wants a real
+;;;; heap -- compiling cl-autowrap under sdl2 exhausts the default dynamic space,
+;;;; hence --dynamic-space-size in the shebang. Loading each system in its own
+;;;; top-level form matters too: `sbcl --script' reads and evaluates form by form,
+;;;; so the packages are interned before the forms that mention them are read.
+
+;;; ═══════════════════════════════════════════════════════════════════════════
+;;; dependencies
+;;; ═══════════════════════════════════════════════════════════════════════════
+
+(require :asdf)
+
+(defun quicklisp-home ()
+  "The Quicklisp root used by both bootstrap and the ART runtime."
+  (let ((override (uiop:getenv "CL_ART_QUICKLISP_HOME")))
+    (if (and override (plusp (length override)))
+        (uiop:ensure-directory-pathname override)
+        (merge-pathnames "quicklisp/" (user-homedir-pathname)))))
+
+#+(and darwin arm64)
+(defun ensure-arch-specs ()
+  "Give cl-autowrap the spec it looks for on Apple Silicon.
+
+It chooses by target triple, which here comes out `aarch64-apple-darwin9' -- a
+name neither cl-sdl2 nor cl-sdl2-ttf ships, though both carry the x86_64 Darwin
+one. Missing it, autowrap shells out to c2ffi, which Homebrew does not package, and
+the whole load dies with `Couldn't execute \"c2ffi\"'. The two specs describe the
+same OS and the same LP64 layout for these types, so copying across is sound.
+
+Done in code because the copies live in the quicklisp dist and a dist update
+deletes them -- as a manual step it is a silent tripwire nobody remembers."
+  (dolist (src (directory (merge-pathnames
+                           "dists/**/src/spec/*.x86_64-apple-darwin9.spec"
+                           (quicklisp-home))))
+    (let ((dst (make-pathname
+                :name (let ((n (pathname-name src)))
+                        (concatenate 'string
+                                     (subseq n 0 (search "x86_64" n))
+                                     "aarch64"
+                                     (subseq n (+ (search "x86_64" n) 6))))
+                :defaults src)))
+      (unless (probe-file dst)
+        (ignore-errors (uiop:copy-file src dst))))))
+
+#+(and darwin arm64)
+(ensure-arch-specs)
+
+(defun substitute-lib (share)
+  "SHARE with its share/common-lisp/ turned into lib/common-lisp/ -- the same
+profile's prebuilt fasls."
+  (let ((i (search "share/common-lisp/" share)))
+    (if i
+        (concatenate 'string (subseq share 0 i) "lib/common-lisp/"
+                     (subseq share (+ i (length "share/common-lisp/"))))
+        share)))
+
+;; Point ASDF at the Guix profile before asking it for anything. The systems are
+;; installed there -- share/common-lisp/sbcl/<name>/<name>.asd -- but ASDF only
+;; looks if CL_SOURCE_REGISTRY says so, and that variable is empty on xyz even in a
+;; login shell, let alone under StumpWM's `exec art'. Relying on the environment
+;; meant art failed there with its own "guix install ..." hint while every package
+;; it wanted was already present. On the mac these paths do not exist, the list
+;; comes out empty, and this is a no-op.
+(let* ((roots (remove-if-not
+               #'probe-file
+               (list (format nil "~a/.guix-home/profile/share/common-lisp/sbcl/"
+                             (uiop:getenv "HOME"))
+                     (format nil "~a/.guix-profile/share/common-lisp/sbcl/"
+                             (uiop:getenv "HOME"))
+                     "/run/current-system/profile/share/common-lisp/sbcl/")))
+       (system-dirs (loop for root in roots
+                          append (uiop:subdirectories root))))
+  (when roots
+    (asdf:initialize-source-registry
+     `(:source-registry
+       ,@(mapcar (lambda (d) `(:directory ,(pathname d))) system-dirs)
+                        :inherit-configuration))
+    ;; And send build output somewhere writable. Those trees live in /gnu/store,
+    ;; which is read-only, so ASDF compiling a dependency in place dies with
+    ;; "Error opening .../proc-parse-tmpXXXX.fasl: Read-only file system". Guix
+    ;; normally arranges this through ASDF_OUTPUT_TRANSLATIONS, which is as unset
+    ;; on that host as CL_SOURCE_REGISTRY was.
+    ;;
+    ;; Map each profile's share/ tree onto its own lib/ tree, which is where Guix
+    ;; keeps the fasls it already built. That is the point of the exercise: pointed
+    ;; anywhere else ASDF decides the store sources are stale and rebuilds them,
+    ;; and rebuilding wants a C compiler for the grovel steps -- `Couldn't execute
+    ;; "gcc"', since no toolchain is in that profile. Anything outside a profile
+    ;; still goes to the user cache.
+    (asdf:initialize-output-translations
+     `(:output-translations
+       ,@(loop for system in system-dirs
+               for share = (namestring (truename system))
+               for lib = (substitute-lib share)
+               when (probe-file lib)
+                 collect `((,(pathname share) :**/ :*.*.*)
+                           (,(pathname lib) :**/ :*.*.*)))
+       (t (,(pathname (format nil "~a/.cache/common-lisp/" (uiop:getenv "HOME")))
+           :implementation :**/ :*.*.*))
+       :inherit-configuration))))
+
+;; Guix hosts have these as sbcl-dexador, sbcl-shasht, sbcl-quri, sbcl-sdl2,
+;; sbcl-sdl2-image and sbcl-sdl2-ttf; the mac reaches the same systems through
+;; quicklisp. ASDF first, so a declared package always wins over whatever
+;; quicklisp happens to have downloaded.
+(let ((systems '(:dexador :shasht :quri :sdl2 :sdl2-image :sdl2-ttf))
+      (setup (merge-pathnames "setup.lisp" (quicklisp-home))))
+  ;; The ASDF attempt is silenced because failing is a normal outcome on the mac,
+  ;; where the registry turns up a stale copy of dexador under ~/.cache/qlot whose
+  ;; .asd aborts -- printing "compilation unit aborted; caught 1 fatal ERROR" on
+  ;; every run for something the quicklisp fallback then handles. Suppressing only
+  ;; the probe keeps a genuine both-ways failure visible below.
+  (handler-case (let ((*standard-output* (make-broadcast-stream))
+                      (*error-output* (make-broadcast-stream)))
+                  (mapc (lambda (system)
+                          (asdf:find-system system)
+                          (asdf:load-system system))
+                        systems))
+    (error ()
+      (handler-case
+          (progn (unless (find-package :ql)
+                   (if (probe-file setup)
+                       (load setup)
+                       (error "no quicklisp at ~a" setup)))
+                 (funcall (find-symbol "QUICKLOAD" :ql) systems :silent t))
+        (error (e)
+          (format *error-output* "~&art: cannot load ~{~a~^ ~}: ~a~%~
+                   Guix: install cl-art from the cl-art channel~%~
+                   mac:  run bash macos/bootstrap from the cl-art checkout~%"
+                  systems e)
+          (uiop:quit 1))))))
+
+;;; ═══════════════════════════════════════════════════════════════════════════
+;;; shared
+;;; ═══════════════════════════════════════════════════════════════════════════
+
+(defparameter *artists*
+  '("Michelangelo" "Rodin" "Sargent"
+    ;; Impressionists. AIC's collection is unusually deep here, which is much of
+    ;; why it is the source: usable public-domain works per name run from Manet at
+    ;; 93 and Degas at 92 down to Caillebotte at 5.
+    "Monet" "Manet" "Degas" "Pissarro" "Renoir" "Cezanne" "Morisot" "Seurat"
+    "Sisley" "Caillebotte"
+    ;; Escher himself cannot be here -- he died in 1972 and all 18 of his works at
+    ;; AIC are is_public_domain false. These are the lineage he drew from and they
+    ;; are out of copyright: Piranesi's impossible prisons, Dürer's polyhedra and
+    ;; perspective, and the Japanese printmakers whose flat interlocking pattern
+    ;; he studied directly. 90 to 100 usable works each.
+    "Piranesi" "Dürer" "Hokusai" "Hiroshige" "Kuniyoshi")
+  "Surnames, matched case-insensitively against AIC's `artist_title': \"Rodin\"
+finds \"Auguste Rodin\", \"Michelangelo\" finds \"Michelangelo Buonarroti\".
+
+Spelling has to be AIC's own, accents and all, because the match does not fold
+them -- and AIC is not consistent: \"Dürer\" finds 99 works where \"Durer\" finds
+none, while \"Cezanne\" finds 33 where \"Cézanne\" finds none. Check a new name
+before adding it rather than assuming either way.")
+
+(defun art-dir ()
+  (or (uiop:getenv "ART_DIR")
+      (format nil "~a/Pictures/Art" (uiop:getenv "HOME"))))
+
+(defun images (dir)
+  "Every jpg under DIR, one level of artist directories down."
+  (loop for sub in (uiop:subdirectories (format nil "~a/" dir))
+        append (remove-if-not (lambda (p) (string-equal "jpg" (pathname-type p)))
+                              (uiop:directory-files sub))))
+
+(defun deal (files n)
+  "N files drawn from FILES without replacement, so two displays never show the
+same painting -- picking independently per display repeated often enough to
+notice. Falls back to repeats only when there is less art than there are screens.
+
+Seeds *RANDOM-STATE* first. Without it SBCL starts every process with the same
+state, so `random' returns the same sequence each run and restarting the viewer
+brought back the identical paintings -- which is the one thing that is supposed to
+change, since nothing rotates while it is up."
+  (setf *random-state* (make-random-state t))
+  (let ((pool (copy-list files)))
+    (loop repeat n
+          collect (if pool
+                      (let ((pick (nth (random (length pool)) pool)))
+                        (setf pool (remove pick pool :test #'equal))
+                        pick)
+                      (nth (random (length files)) files)))))
+
+(defun die (fmt &rest args)
+  (format *error-output* "~&art: ~?~%" fmt args)
+  (uiop:quit 1))
+
+;;; ═══════════════════════════════════════════════════════════════════════════
+;;; fetch — Art Institute of Chicago
+;;; ═══════════════════════════════════════════════════════════════════════════
+;;;
+;;; AIC and not the Met, which was tried first: the Met's `artistOrCulture=true'
+;;; returns 0 results for every name, and its plain search matches any object
+;;; *mentioning* the name -- asking for Sargent yields Posada, Guido Reni and
+;;; Memling, not one Sargent. AIC returns `artist_title' as a field, so the
+;;; attribution is checked rather than hoped for.
+
+(defparameter *api* "https://api.artic.edu/api/v1/artworks/search")
+(defparameter *iiif* "https://www.artic.edu/iiif/2")
+(defparameter *limit* 25 "Images per artist per run.")
+(defparameter *pool* 100 "Search hits to sift per artist; AIC caps a page here.")
+
+(defparameter *width* 1686
+  "IIIF bounding box, used as `!W,W' -- fit inside, never upscale. The plain `W,'
+form asks for an exact width and AIC answers 403 for any original narrower than
+it, which is how a third of the Rodins failed to download.")
+
+;; AIC asks API users to identify themselves so they can get in touch about usage.
+(defparameter *headers*
+  '(("AIC-User-Agent" . "guix-config art (dig :at gashinsky :dot com)")))
+
+(defun api-search (artist)
+  "AIC records mentioning ARTIST. Shasht keys objects with STRINGS and reads
+arrays as vectors, so callers use GETHASH with string keys."
+  (coerce (or (gethash "data"
+                       (shasht:read-json
+                        (dex:get (format nil "~a?q=~a&fields=~a&limit=~a"
+                                         *api* (quri:url-encode artist)
+                                         "id,title,artist_title,image_id,is_public_domain,date_display"
+                                         *pool*)
+                                 :headers *headers*)))
+              #())
+          'list))
+
+(defun keeper-p (record artist)
+  "Public domain, has an image, and actually BY the artist rather than merely
+mentioning them. STRINGP rather than a truth test on the text fields: shasht
+renders JSON null as :NULL, which is true enough to pass a bare check and then
+fails inside SEARCH as `not of type SEQUENCE' -- one unattributed record used to
+end the whole run."
+  (let ((who (gethash "artist_title" record)))
+    (and (eq t (gethash "is_public_domain" record))
+         (stringp (gethash "image_id" record))
+         (stringp who)
+         (search artist who :test #'char-equal))))
+
+(defun safe-name (title id)
+  "TITLE reduced to what a filesystem takes, with ID kept on the end. Both parts
+earn their place: AIC repeats titles -- half a dozen `Seated Male Nude' among the
+Sargents -- and a bare title silently overwrites its namesake, while a null title
+needs somewhere to fall back to."
+  (let* ((clean (if (stringp title)
+                    (string-trim " " (remove-if-not (lambda (c)
+                                                      (or (alphanumericp c)
+                                                          (member c '(#\Space #\- #\_))))
+                                                    title))
+                    ""))
+         (stem (subseq clean 0 (min 70 (length clean)))))
+    (if (zerop (length stem))
+        (princ-to-string id)
+        (format nil "~a-~a" stem id))))
+
+(defun date-path (image-path)
+  "Sidecar containing AIC's human-readable date for IMAGE-PATH."
+  (make-pathname :type "date" :defaults image-path))
+
+(defun remember-date (record image-path)
+  "Keep an artwork's displayed date beside its image for offline captions."
+  (let ((date (gethash "date_display" record)))
+    (when (and (stringp date) (plusp (length date)))
+      (with-open-file (out (date-path image-path)
+                           :direction :output
+                           :if-exists :supersede
+                           :if-does-not-exist :create)
+        (write-string date out)))))
+
+(defun download (image-id path)
+  (let ((bytes (dex:get (format nil "~a/~a/full/!~a,~a/0/default.jpg"
+                                *iiif* image-id *width* *width*)
+                        :force-binary t)))
+    (with-open-file (out path :direction :output
+                              :element-type '(unsigned-byte 8)
+                              :if-exists :supersede
+                              :if-does-not-exist :create)
+      (write-sequence bytes out))))
+
+(define-condition throttled (error) ()
+  (:documentation "AIC answered 403 on the image endpoint.
+
+It does that once a run has pulled a few hundred images, and it does it for every
+image afterwards -- including ones fetched successfully minutes earlier. Without
+telling them apart, a throttled run reports `download failed' against a hundred
+titles in a row and looks like the artists are unavailable."))
+
+(defun save-image (record path)
+  "T when PATH was written, else NIL and a printable reason.
+
+The status is read off the condition rather than matched by class: dexador signals
+plain HTTP-REQUEST-FAILED for a 403 here, not its HTTP-REQUEST-FORBIDDEN subclass,
+so handling that subclass never fired. And the reason is reported rather than
+swallowed -- `download failed' against a hundred titles told me nothing about
+whether the art was missing, the request malformed, or the host simply done with
+us."
+  (handler-case (progn (download (gethash "image_id" record) path) t)
+    (dex:http-request-failed (e)
+      (if (eql 403 (dex:response-status e))
+          (error 'throttled)
+          (values nil (format nil "HTTP ~a" (dex:response-status e)))))
+    (error (e) (values nil (string-downcase (princ-to-string (type-of e)))))))
+
+(defun fetch-artist (artist dir limit)
+  (let ((target (format nil "~a/~a" dir artist))
+        (got 0)
+        (had 0))
+    (ensure-directories-exist (format nil "~a/" target))
+    (format t "~&~a~%" artist)
+    (dolist (record (api-search artist))
+      (when (>= (+ got had) limit) (return))
+      (when (keeper-p record artist)
+        (let ((path (format nil "~a/~a.jpg" target
+                            (safe-name (gethash "title" record)
+                                       (gethash "id" record)))))
+          (cond ((probe-file path)
+                 (incf had)
+                 (remember-date record path))
+                (t (multiple-value-bind (ok why) (save-image record path)
+                     (cond (ok (incf got)
+                               (remember-date record path)
+                               (sleep 1/2)         ;AIC asks for restraint
+                               (format t "  + ~a~%" (file-namestring path)))
+                           (t (format t "  ! ~a (~a)~%"
+                                      (gethash "title" record) why)))))))))
+    (format t "  ~a new, ~a already present~%" got had)
+    (+ got had)))
+
+(defun fetch (artists dir limit)
+  (let ((total 0))
+    (handler-case (dolist (artist artists)
+                    (incf total (fetch-artist artist dir limit)))
+      (throttled ()
+        (format t "~&  AIC is refusing images (403) -- rate limited.~%~
+                     Everything downloaded so far is kept; run `art fetch' again~%~
+                     later and it picks up where this left off.~%")))
+    (format t "~&~a image~:p under ~a~%" total dir)))
+
+;;; ═══════════════════════════════════════════════════════════════════════════
+;;; show — a still on every display
+;;; ═══════════════════════════════════════════════════════════════════════════
+
+(defun caption (file)
+  "\"Title — Artist\" read back out of the path. FETCH already encodes both: the
+artist is the directory and the file is `<title>-<AIC id>.jpg', so the label costs
+no extra request and stays right even for art added by hand."
+  (let* ((stem (pathname-name file))
+         (dash (position #\- stem :from-end t))
+         (tail (and dash (subseq stem (1+ dash))))
+         (title (if (and tail (every #'digit-char-p tail) (plusp (length tail)))
+                    (subseq stem 0 dash)
+                    stem))
+         (artist (car (last (pathname-directory file))))
+         (sidecar (date-path file))
+         (date (and (probe-file sidecar)
+                    (string-trim '(#\Space #\Tab #\Newline #\Return)
+                                 (uiop:read-file-string sidecar)))))
+    (format nil "~a~@[ — ~a~]~@[, ~a~]"
+            title (and (stringp artist) artist)
+            (and date (plusp (length date)) date))))
+
+(defparameter *font-candidates*
+  (list (format nil "~a/.guix-home/profile/share/fonts/truetype/IBMPlexSans-Regular.ttf"
+                (uiop:getenv "HOME"))
+        "/System/Library/Fonts/Supplemental/Arial.ttf"
+        "/System/Library/Fonts/Supplemental/Times New Roman.ttf"
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+  "Explicit paths first; ANY-FONT falls back to a scan of the Guix profile, whose
+font paths carry store hashes and cannot be written down.")
+
+(defun any-font ()
+  (or (find-if #'probe-file *font-candidates*)
+      (let ((dir (format nil "~a/.guix-home/profile/share/fonts/" (uiop:getenv "HOME"))))
+        (car (sort (loop for sub in (cons (pathname dir)
+                                          (ignore-errors (uiop:subdirectories dir)))
+                         append (remove-if-not
+                                 (lambda (p)
+                                   (and (member (pathname-type p) '("ttf" "otf")
+                                                :test #'string-equal)
+                                        (notany (lambda (word)
+                                                  (search word (file-namestring p)
+                                                          :test #'char-equal))
+                                                '("icon" "emoji"))))
+                                 (ignore-errors (uiop:directory-files sub))))
+                   #'string< :key #'namestring)))))
+
+(defun blit-text (renderer font text x y r g b)
+  "TEXT once at X,Y in one colour. Returns its width and height."
+  (let ((surface (sdl2-ttf:render-utf8-blended font text r g b 255)))
+    (when surface
+      (let ((texture (sdl2:create-texture-from-surface renderer surface)))
+        (sdl2:free-surface surface)
+        (multiple-value-bind (format access w h) (sdl2:query-texture texture)
+          (declare (ignore format access))
+          (sdl2:render-copy renderer texture :dest-rect (sdl2:make-rect x y w h))
+          (sdl2:destroy-texture texture)
+          (values w h))))))
+
+(defun draw-caption (renderer font text dw dh)
+  "TEXT in the lower-right corner, white on a translucent dark plate.
+
+The plate rather than a brighter colour or a shadow: a letterboxed portrait leaves
+black beside it, but a landscape fills the frame, so the label lands on pale sky or
+bare canvas as readily as on black -- grey on cream was barely legible. A plate
+holds its contrast whatever is behind it, and at this alpha it reads as a caption
+rather than a box."
+  (multiple-value-bind (w h) (sdl2-ttf:size-text font text)
+    (let* ((pad (max 12 (floor dh 45)))            ;gap from the screen edges
+           (inset (max 6 (floor h 4)))             ;plate's own padding
+           (x (- dw w pad))
+           (y (- dh h pad)))
+      (sdl2:set-render-draw-blend-mode renderer :blend)
+      (sdl2:set-render-draw-color renderer 0 0 0 150)
+      (sdl2:render-fill-rect renderer
+                             (sdl2:make-rect (- x inset) (- y (floor inset 2))
+                                             (+ w inset inset) (+ h inset)))
+      (blit-text renderer font text x y 250 250 250))))
+
+(defun fit (iw ih dw dh)
+  "IW x IH scaled to fit inside DW x DH, centred. Letterboxed rather than cropped:
+bars beside a Sargent are better than cutting one in half."
+  (let* ((scale (min (/ dw iw) (/ dh ih)))
+         (w (floor (* iw scale)))
+         (h (floor (* ih scale))))
+    (values (floor (- dw w) 2) (floor (- dh h) 2) w h)))
+
+(defun draw (renderer texture dw dh &optional font label)
+  "One frame, drawn once. Nothing redraws it -- see the banner."
+  (sdl2:set-render-draw-color renderer 0 0 0 255)
+  (sdl2:render-clear renderer)
+  (multiple-value-bind (format access iw ih) (sdl2:query-texture texture)
+    (declare (ignore format access))
+    (multiple-value-bind (x y w h) (fit iw ih dw dh)
+      (sdl2:render-copy renderer texture :dest-rect (sdl2:make-rect x y w h))))
+  (when (and font label)
+    (ignore-errors (draw-caption renderer font label dw dh)))
+  (sdl2:render-present renderer))
+
+(defun open-screens ()
+  "A fullscreen window and renderer per display.
+
+GET-DISPLAY-BOUNDS hands back one SDL-RECT, not four values, and its numbers are
+points rather than pixels -- which is what CREATE-WINDOW wants anyway. Origins go
+negative for displays left of or above the main one, so they pass through
+untouched. SHOW-WINDOW and RAISE-WINDOW are not decoration: created is not the
+same as visible, and :desktop fullscreen is what puts them above the menu bar."
+  (loop for i below (sdl2:get-num-video-displays)
+        for bounds = (sdl2:get-display-bounds i)
+        for w = (sdl2:rect-width bounds)
+        for h = (sdl2:rect-height bounds)
+        collect (let* ((window (sdl2:create-window :x (sdl2:rect-x bounds)
+                                                   :y (sdl2:rect-y bounds)
+                                                   :w w :h h
+                                                   :flags '(:borderless :shown)))
+                       (renderer (progn (sdl2:set-window-fullscreen window :desktop)
+                                        (sdl2:raise-window window)
+                                        (sdl2:create-renderer window -1 '(:accelerated)))))
+                  ;; Draw in the renderer's own units, not the display's. Bounds
+                  ;; are points and on a Retina panel the renderer is twice that
+                  ;; in pixels; mixing them put the caption a half-height below
+                  ;; the edge, clipping its descenders.
+                  (multiple-value-bind (ow oh) (sdl2:get-renderer-output-size renderer)
+                    (list :w (or ow w) :h (or oh h) :window window :renderer renderer)))))
+
+(defun watch (settle)
+  "Block until dismissed. Both the keyboard and the mouse work, and having two
+ways out is deliberate: an earlier version listened for keys alone and once sat
+unresponsive across all three displays with nothing but cmd-tab to escape it.
+Motion is ignored until SETTLE has passed -- the hand that reaches for s-l is
+often still on the mouse, and a stray twitch would dismiss the art before it is
+seen. No time limit: it holds until told to go."
+  (let ((event (sdl2:new-event))
+        (deadline (+ (get-internal-real-time)
+                     (* settle internal-time-units-per-second))))
+    ;; Throw away the burst that window creation queues -- shown, exposed, focus,
+    ;; and the cursor's position as a mousemotion. Watching from a dirty queue is
+    ;; what made the art flash up and vanish.
+    (sleep 0.3)
+    (loop while (plusp (sdl2:next-event event :poll)))
+    (loop do (loop while (plusp (sdl2:next-event event :poll))
+                   for type = (sdl2:get-event-type event)
+                   do (when (or (member type '(:quit :keydown :mousebuttondown :mousewheel))
+                                (and (eq type :mousemotion)
+                                     (> (get-internal-real-time) deadline)))
+                        (return-from watch)))
+             (sleep 0.1))))
+
+(defun show (dir)
+  (let ((files (images dir)))
+    (when (null files)
+      (die "no images under ~a -- run `art fetch' first" dir))
+    ;; MAKE-THIS-THREAD-MAIN is not optional on macOS: SDL wants the real main
+    ;; thread and WITH-INIT simply hangs without it.
+    (sdl2:make-this-thread-main
+     (lambda ()
+       (sdl2:init :video)
+       (sdl2-image:init '(:jpg))
+       (ignore-errors (sdl2-ttf:init))
+       (sdl2:hide-cursor)
+       (format *error-output* "~&art: ~a image~:p on ~a display~:p~%"
+               (length files) (sdl2:get-num-video-displays))
+       (finish-output *error-output*)
+       (let ((screens (open-screens)))
+         (unwind-protect
+              (progn
+                (loop with path = (any-font)
+                      for screen in screens
+                      for file in (deal files (length screens))
+                      do (format *error-output* "  ~a~%" (caption file))
+                         ;; Font per screen, sized from that screen: one shared
+                         ;; font would look right on the built-in display and
+                         ;; wrong on a 5K one.
+                         (let ((font (and path
+                                          (ignore-errors
+                                           (sdl2-ttf:open-font
+                                            path (max 13 (floor (getf screen :h) 55))))))
+                               (surface (sdl2-image:load-image file)))
+                           (when surface
+                             (let ((texture (sdl2:create-texture-from-surface
+                                             (getf screen :renderer) surface)))
+                               (sdl2:free-surface surface)
+                               (draw (getf screen :renderer) texture
+                                     (getf screen :w) (getf screen :h)
+                                     font (caption file))
+                               (sdl2:destroy-texture texture)))
+                           (when font (ignore-errors (sdl2-ttf:close-font font)))))
+                (watch 3/2))
+           (dolist (screen screens)
+             (ignore-errors (sdl2:destroy-window (getf screen :window))))
+           (sdl2:show-cursor)
+           (sdl2:quit)))))))
+
+;;; ═══════════════════════════════════════════════════════════════════════════
+;;; cli
+;;; ═══════════════════════════════════════════════════════════════════════════
+
+(defun usage ()
+  (format t "usage: art [fetch|show] [options]
+
+  art fetch [ARTIST...] [--limit N]   download public-domain works from the
+                                      Art Institute of Chicago
+  art show                            a still on every display, until a keypress
+                                      or a mouse move
+  art                                 show, fetching first if ART_DIR is empty
+
+options:
+  --dir PATH      where the art lives (default $ART_DIR, else ~~/Pictures/Art)
+  --limit N       images per artist per fetch (default ~a)
+
+default artists: ~{~a~^ ~}
+
+examples:
+  art                              # look at art
+  art fetch Vermeer --limit 40     # add a painter
+  art show                         # a different random set every time
+" *limit* *artists*))
+
+(defun opt (argv name &optional default)
+  (let ((i (position name argv :test #'string=)))
+    (if i (nth (1+ i) argv) default)))
+
+(defun main ()
+  (let ((argv (uiop:command-line-arguments)))
+    (cond
+      ((intersection '("--help" "-h") argv :test #'string=) (usage))
+      (t
+       (let* ((dir (opt argv "--dir" (art-dir)))
+              (limit (or (parse-integer (or (opt argv "--limit") "") :junk-allowed t) *limit*))
+              (consumed (loop for (a b) on argv
+                              when (member a '("--dir" "--limit") :test #'string=)
+                                collect a and collect b))
+              (words (remove-if (lambda (a) (member a consumed :test #'equal)) argv))
+              (command (first words)))
+         (cond
+           ((equal command "fetch") (fetch (or (rest words) *artists*) dir limit))
+           ((equal command "show")  (show dir))
+           ((null command)
+            (unless (images dir) (fetch *artists* dir limit))
+            (show dir))
+           (t (die "unknown command ~s -- try --help" command))))))))
+
+(main)

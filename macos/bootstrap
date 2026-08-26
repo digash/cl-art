@@ -1,0 +1,431 @@
+#!/usr/bin/env bash
+# Install cl-art on macOS and transfer its Homebrew dependencies out of
+# guix-sync's managed set without uninstalling them.
+
+set -euo pipefail
+
+program=${0##*/}
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+repo_root=$(cd -- "$script_dir/.." && pwd -P)
+brewfile=$script_dir/Brewfile
+quicklisp_driver=${CL_ART_QUICKLISP_DRIVER:-$script_dir/quicklisp-systems.lisp}
+art_source=$repo_root/bin/art
+state_root=${XDG_STATE_HOME:-${HOME:?HOME is not set}/.local/state}
+art_bin_dir=${CL_ART_BIN_DIR:-${HOME:?HOME is not set}/.local/bin}
+art_destination=$art_bin_dir/art
+quicklisp_home=${CL_ART_QUICKLISP_HOME:-${HOME:?HOME is not set}/quicklisp}
+quicklisp_home=${quicklisp_home%/}
+quicklisp_setup=$quicklisp_home/setup.lisp
+sbcl_command=${CL_ART_SBCL:-}
+mode=install
+dry_run=0
+install_art=1
+
+required_formulae=(
+  sbcl
+  sdl2-compat
+  sdl2_image
+  sdl2_ttf
+)
+
+# SBCL is shared infrastructure and remains under guix-sync ownership.  Only
+# the native SDL libraries move to cl-art's Brewfile ownership.
+owned_formulae=(
+  sdl2-compat
+  sdl2_image
+  sdl2_ttf
+)
+
+state_files=(
+  "$state_root/guix-sync/brew-managed"
+  "$state_root/mac-sync/brew-managed"
+)
+
+usage() {
+  cat <<EOF
+usage: $program [--install | --adopt-only | --check] [--dry-run] [--no-install-art]
+
+  --install          install the Brewfile and Quicklisp systems, install art,
+                     then transfer SDL ownership from guix-sync (default)
+  --adopt-only       require Brew formulae to exist, ensure Quicklisp and its
+                     systems, then transfer SDL ownership without brew bundle
+  --check            verify Brew, Quicklisp systems, art, and ownership without
+                     downloads or other installation changes
+  --dry-run          print the changes that --install or --adopt-only would make
+  --no-install-art   manage dependencies only; do not install ~/.local/bin/art
+
+Run this while guix-sync is idle.  Changed files receive a one-time
+.before-cl-art backup next to the original.
+
+If ~/quicklisp/setup.lisp is absent, set both CL_ART_QUICKLISP_INSTALLER to a
+trusted local quicklisp.lisp and CL_ART_QUICKLISP_INSTALLER_SHA256 to its
+independently verified SHA-256.  The bootstrap never downloads an unpinned
+installer.  CL_ART_QUICKLISP_HOME, CL_ART_SBCL, CL_ART_BIN_DIR, and
+XDG_STATE_HOME override paths for isolated testing.
+EOF
+}
+
+while (($#)); do
+  case $1 in
+    --install) mode=install ;;
+    --adopt-only) mode=adopt ;;
+    --check) mode=check ;;
+    --dry-run) dry_run=1 ;;
+    --no-install-art) install_art=0 ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      printf '%s: unknown option: %s\n' "$program" "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+if [[ ${CL_ART_BOOTSTRAP_TESTING:-0} != 1 && $(uname -s) != Darwin ]]; then
+  printf '%s: this bootstrap is for macOS\n' "$program" >&2
+  exit 1
+fi
+
+if [[ ! -f $brewfile ]]; then
+  printf '%s: missing Brewfile: %s\n' "$program" "$brewfile" >&2
+  exit 1
+fi
+if [[ ! -f $quicklisp_driver ]]; then
+  printf '%s: missing Quicklisp system driver: %s\n' \
+    "$program" "$quicklisp_driver" >&2
+  exit 1
+fi
+if [[ -z $quicklisp_home ]]; then
+  printf '%s: CL_ART_QUICKLISP_HOME must not be empty or /\n' "$program" >&2
+  exit 1
+fi
+
+brew_command=${CL_ART_BREW:-}
+if [[ -z $brew_command ]]; then
+  brew_command=$(command -v brew || true)
+fi
+if [[ -z $brew_command || ! -x $brew_command ]]; then
+  printf '%s: Homebrew is required but brew was not found\n' "$program" >&2
+  exit 1
+fi
+
+is_cl_art_formula() {
+  case $1 in
+    sdl2-compat|sdl2_image|sdl2_ttf) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+verify_formulae() {
+  local formula
+  local missing=0
+
+  for formula in "${required_formulae[@]}"; do
+    if ! "$brew_command" list --formula "$formula" >/dev/null 2>&1; then
+      printf '%s: required Homebrew formula is not installed: %s\n' \
+        "$program" "$formula" >&2
+      missing=1
+    fi
+  done
+  ((missing == 0))
+}
+
+state_has_formula() {
+  local state_file=$1
+  local formula
+
+  [[ -f $state_file ]] || return 1
+  for formula in "${owned_formulae[@]}"; do
+    if grep -Fqx -- "$formula" "$state_file"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+resolve_sbcl_command() {
+  if [[ -z $sbcl_command ]]; then
+    sbcl_command=$(command -v sbcl || true)
+  fi
+  if [[ -z $sbcl_command || ! -x $sbcl_command ]]; then
+    printf '%s: SBCL is required but was not found\n' "$program" >&2
+    return 1
+  fi
+}
+
+quicklisp_target_is_safe() {
+  local first_entry
+
+  if [[ -e $quicklisp_home && ! -d $quicklisp_home ]]; then
+    printf '%s: Quicklisp target is not a directory: %s\n' \
+      "$program" "$quicklisp_home" >&2
+    return 1
+  fi
+  if [[ -d $quicklisp_home ]]; then
+    first_entry=$(find "$quicklisp_home" -mindepth 1 -maxdepth 1 -print -quit)
+    if [[ -n $first_entry ]]; then
+      printf '%s: refusing to modify incomplete non-empty Quicklisp directory: %s\n' \
+        "$program" "$quicklisp_home" >&2
+      return 1
+    fi
+  fi
+}
+
+verified_quicklisp_installer() {
+  local installer=${CL_ART_QUICKLISP_INSTALLER:-}
+  local expected=${CL_ART_QUICKLISP_INSTALLER_SHA256:-}
+  local actual_with_name
+  local actual
+
+  if [[ -z $installer || -z $expected ]]; then
+    printf '%s: Quicklisp is absent; provide a trusted installer and SHA-256 via\n' \
+      "$program" >&2
+    printf '  CL_ART_QUICKLISP_INSTALLER and CL_ART_QUICKLISP_INSTALLER_SHA256\n' >&2
+    return 1
+  fi
+  if [[ ! -f $installer ]]; then
+    printf '%s: Quicklisp installer is not a regular file: %s\n' \
+      "$program" "$installer" >&2
+    return 1
+  fi
+  if [[ ! $expected =~ ^[0123456789abcdefABCDEF]{64}$ ]]; then
+    printf '%s: Quicklisp installer SHA-256 must contain exactly 64 hex digits\n' \
+      "$program" >&2
+    return 1
+  fi
+  expected=$(printf '%s' "$expected" | tr 'ABCDEF' 'abcdef')
+  actual_with_name=$(shasum -a 256 -- "$installer")
+  actual=${actual_with_name%% *}
+  if [[ $actual != "$expected" ]]; then
+    printf '%s: Quicklisp installer checksum mismatch\n' "$program" >&2
+    printf '  expected: %s\n  actual:   %s\n' "$expected" "$actual" >&2
+    return 1
+  fi
+  printf '%s\n' "$installer"
+}
+
+ensure_quicklisp() {
+  local installer
+
+  if [[ -f $quicklisp_setup ]]; then
+    printf '  preserving existing Quicklisp: %s\n' "$quicklisp_setup"
+    return 0
+  fi
+  quicklisp_target_is_safe
+  installer=$(verified_quicklisp_installer)
+  if ((dry_run)); then
+    printf '  would install verified Quicklisp installer %s into %s\n' \
+      "$installer" "$quicklisp_home"
+    return 0
+  fi
+
+  mkdir -p -- "$(dirname -- "$quicklisp_home")"
+  CL_ART_QUICKLISP_HOME="$quicklisp_home" \
+    "$sbcl_command" --noinform --non-interactive \
+      --load "$installer" \
+      --eval '(quicklisp-quickstart:install
+               :path (pathname
+                      (format nil "~a/"
+                              (sb-ext:posix-getenv
+                               "CL_ART_QUICKLISP_HOME"))))' \
+      --quit
+  if [[ ! -f $quicklisp_setup ]]; then
+    printf '%s: Quicklisp installer completed without creating %s\n' \
+      "$program" "$quicklisp_setup" >&2
+    return 1
+  fi
+  printf '  installed Quicklisp: %s\n' "$quicklisp_setup"
+}
+
+run_quicklisp_systems() {
+  local quicklisp_mode=$1
+
+  if ((dry_run)); then
+    printf '  would %s cl-art systems through %s\n' \
+      "$quicklisp_mode" "$quicklisp_setup"
+    return 0
+  fi
+  if [[ ! -f $quicklisp_setup ]]; then
+    printf '%s: Quicklisp setup is missing: %s\n' \
+      "$program" "$quicklisp_setup" >&2
+    return 1
+  fi
+  CL_ART_QUICKLISP_SETUP="$quicklisp_setup" \
+  CL_ART_QUICKLISP_MODE="$quicklisp_mode" \
+    "$sbcl_command" --dynamic-space-size 4096 --noinform --non-interactive \
+      --load "$quicklisp_driver" --quit
+}
+
+preflight_state_files() {
+  local state_file
+
+  for state_file in "${state_files[@]}"; do
+    if [[ ( -e $state_file || -L $state_file ) && \
+          ( -L $state_file || ! -f $state_file ) ]]; then
+      printf '%s: refusing to replace non-regular state file: %s\n' \
+        "$program" "$state_file" >&2
+      return 1
+    fi
+  done
+}
+
+forget_state_file() {
+  local state_file=$1
+  local backup_file=${state_file}.before-cl-art
+  local temporary_file
+  local line
+  local removed=0
+
+  if [[ ! -e $state_file && ! -L $state_file ]]; then
+    printf '  guix-sync state absent: %s\n' "$state_file"
+    return 0
+  fi
+  if [[ -L $state_file || ! -f $state_file ]]; then
+    printf '%s: refusing to replace non-regular state file: %s\n' \
+      "$program" "$state_file" >&2
+    return 1
+  fi
+  if ! state_has_formula "$state_file"; then
+    printf '  guix-sync already relinquished: %s\n' "$state_file"
+    return 0
+  fi
+  if ((dry_run)); then
+    printf '  would remove cl-art formulae from %s\n' "$state_file"
+    printf '  would preserve the original as %s\n' "$backup_file"
+    return 0
+  fi
+
+  if [[ ! -e $backup_file && ! -L $backup_file ]]; then
+    cp -p -- "$state_file" "$backup_file"
+  fi
+  temporary_file=$(mktemp "${state_file}.cl-art.XXXXXX")
+  cp -p -- "$state_file" "$temporary_file"
+
+  while IFS= read -r line || [[ -n $line ]]; do
+    if is_cl_art_formula "$line"; then
+      removed=$((removed + 1))
+    else
+      printf '%s\n' "$line"
+    fi
+  done < "$state_file" > "$temporary_file"
+
+  if ((removed == 0)); then
+    rm -f -- "$temporary_file"
+    return 0
+  fi
+  mv -f -- "$temporary_file" "$state_file"
+  printf '  removed %d cl-art formula entr%s from %s\n' \
+    "$removed" "$([[ $removed == 1 ]] && printf y || printf ies)" "$state_file"
+  printf '  backup: %s\n' "$backup_file"
+}
+
+install_art_command() {
+  local backup_file=${art_destination}.before-cl-art
+  local temporary_file
+
+  if [[ ! -f $art_source ]]; then
+    printf '%s: missing art source: %s\n' "$program" "$art_source" >&2
+    return 1
+  fi
+  if [[ -d $art_destination && ! -L $art_destination ]]; then
+    printf '%s: refusing to replace directory: %s\n' \
+      "$program" "$art_destination" >&2
+    return 1
+  fi
+  if ((dry_run)); then
+    printf '  would install %s -> %s\n' "$art_source" "$art_destination"
+    if [[ -e $art_destination || -L $art_destination ]]; then
+      printf '  would preserve the previous command as %s\n' "$backup_file"
+    fi
+    return 0
+  fi
+
+  mkdir -p -- "$art_bin_dir"
+  if [[ ( -e $art_destination || -L $art_destination ) && \
+        ! -e $backup_file && ! -L $backup_file ]]; then
+    cp -pP -- "$art_destination" "$backup_file"
+  fi
+  temporary_file=$(mktemp "${art_destination}.cl-art.XXXXXX")
+  install -m 0755 "$art_source" "$temporary_file"
+  mv -f -- "$temporary_file" "$art_destination"
+  printf '  installed: %s\n' "$art_destination"
+  if [[ -e $backup_file || -L $backup_file ]]; then
+    printf '  previous command backup: %s\n' "$backup_file"
+  fi
+}
+
+check_handoff() {
+  local state_file
+  local failed=0
+
+  # `brew bundle check` may tap homebrew/core or consult the API even with
+  # Homebrew's update flags disabled.  Formula inventory is local and is the
+  # complete condition this handoff needs to verify.
+  if ! verify_formulae; then
+    failed=1
+  fi
+  if ! resolve_sbcl_command; then
+    failed=1
+  elif [[ ! -f $quicklisp_setup ]]; then
+    printf '%s: Quicklisp setup is missing: %s\n' \
+      "$program" "$quicklisp_setup" >&2
+    failed=1
+  elif ! run_quicklisp_systems check; then
+    failed=1
+  fi
+  if ((install_art)); then
+    if [[ ! -x $art_destination ]] || ! cmp -s -- "$art_source" "$art_destination"; then
+      printf '%s: installed art does not match %s\n' \
+        "$program" "$art_source" >&2
+      failed=1
+    fi
+  fi
+  for state_file in "${state_files[@]}"; do
+    if state_has_formula "$state_file"; then
+      printf '%s: guix-sync still manages a cl-art formula in %s\n' \
+        "$program" "$state_file" >&2
+      failed=1
+    fi
+  done
+  ((failed == 0))
+}
+
+case $mode in
+  check)
+    check_handoff
+    printf 'cl-art macOS installation is consistent\n'
+    ;;
+  install|adopt)
+    if [[ $mode == install ]]; then
+      if ((dry_run)); then
+        printf 'would run: %s bundle --file=%s\n' "$brew_command" "$brewfile"
+      else
+        "$brew_command" bundle --file="$brewfile"
+      fi
+    fi
+    if ((! dry_run)); then
+      verify_formulae
+      resolve_sbcl_command
+    elif [[ -z $sbcl_command ]]; then
+      sbcl_command=sbcl
+    fi
+    ensure_quicklisp
+    run_quicklisp_systems preload
+    preflight_state_files
+    if ((install_art)); then
+      install_art_command
+    fi
+    for state_file in "${state_files[@]}"; do
+      forget_state_file "$state_file"
+    done
+    if ((dry_run)); then
+      printf 'dry run complete; no files changed\n'
+    else
+      printf 'cl-art now owns its command, SDL formulae, and Quicklisp systems\n'
+    fi
+    ;;
+esac

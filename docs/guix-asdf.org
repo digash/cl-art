@@ -1,0 +1,45 @@
+#+title: Guix ASDF and Prebuilt FASLs
+
+* Guix layout
+
+Guix installs an SBCL system's sources and =.asd= file below
+=<profile>/share/common-lisp/sbcl/<system>/= and its already-built FASLs below
+=<profile>/lib/common-lisp/sbcl/<system>/=.  Hosts do not always set
+=CL_SOURCE_REGISTRY= or =ASDF_OUTPUT_TRANSLATIONS=, so =bin/art= initializes
+both before loading its systems.
+
+* Register system directories, not the parent tree
+
+Add each immediate system directory with ASDF's =:directory= directive.  Do
+not register the parent =share/common-lisp/= directory with =:tree=.  The
+recursive form also discovers nested source trees; ASDF can then prefer those
+sources and attempt a rebuild.  SDL groveling needs a compiler, producing
+=Couldn't execute "gcc"= when no toolchain is in the runtime profile.
+
+* Translate canonical source paths to FASL paths
+
+Resolve every system directory with =truename= before replacing
+=share/common-lisp/= with =lib/common-lisp/=.  A Guix profile is a symlink farm
+into =/gnu/store=, and ASDF compares canonical paths.  A translation keyed by
+the visible profile symlink does not match the canonical source path and ASDF
+tries to write beside the read-only source, failing with an error such as:
+
+#+begin_example
+Error opening .../proc-parse-tmpXXXX.fasl: Read-only file system
+#+end_example
+
+Keep a writable user-cache translation as the fallback for systems outside a
+Guix profile.  The complete, tested setup is in the dependency section of
+=bin/art=.
+
+* Package ownership
+
+Do not declare ART's Lisp packages or closure traversal in a consumer's
+=common.scm=.  The =cl-art= package propagates SBCL and the complete rewritten
+closure so installation links the source and FASL trees into the active
+profile.  ART-specific c2ffi, libffi-include, and SDL TTF header repairs live in
+=modules/cl-art/packages/lisp.scm=.
+
+The earlier advice to keep SDL packages out of a shared Home configuration was
+a workaround for an unrepaired aarch64 build.  It is obsolete: the channel now
+owns the repaired packages, while consumers select only =cl-art=.

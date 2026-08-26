@@ -1,0 +1,45 @@
+#+title: Historical: Shared ART Lisp Dependency Closure
+
+* Status
+
+This records the 2026-08-21 fix in =guix-config=.  It is historical: the
+standalone =cl-art= channel now owns the package closure and consumers install
+only the =cl-art= package.
+
+* Problem
+
+=art= loaded Dexador, Shasht, QURI, SDL2, SDL2-image, and SDL2-ttf from the
+active Guix profile.  Its dependency closure was initially added only to the
+=dig= Home configuration even though the script was shared.  Other Home
+configurations therefore lacked direct packages such as CFFI and transitive
+systems such as Alexandria, so ASDF could not reliably load the application.
+
+Installing only the six top-level systems was insufficient.  ART's profile
+registry deliberately exposes each Guix-built SBCL system and its matching
+FASL tree, so every normal or propagated SBCL input also had to be linked into
+the profile.
+
+* Historical decision
+
+The fix moved =%art-lisp-packages= from the =dig= Home module into
+=config/home/common.scm=.  Starting with CFFI plus the six loaded systems, it
+walked package inputs and propagated inputs recursively, retained =sbcl-*=
+packages, and appended the result to the shared package objects.  Dependency
+selection and ART's ASDF behavior were intentionally left unchanged.
+
+A regression check required both =sbcl-cffi= and transitive
+=sbcl-alexandria=.  The planned verification also evaluated both Home
+configurations, checked the profile's Alexandria system, and exercised
+=art fetch= past the earlier QURI/FASL failure.
+
+* Outcome and supersession
+
+Both Home configurations received the same Lisp closure.  Subsequent aarch64
+build failures exposed missing c2ffi inputs and SDL wrapper defects; those
+repairs were added before the closure could build on the VM.
+
+The arrangement solved the runtime failure but made an unrelated shared Home
+module own ART internals.  The current replacement is
+=modules/cl-art/packages/lisp.scm=, which owns the repaired closure, and
+=modules/cl-art/packages/art.scm=, whose =cl-art= package propagates it.  A
+consumer must not recreate the old closure traversal in its common Home module.

@@ -1,0 +1,74 @@
+#+title: cl-art Release and Consumer Cutover
+
+* First authenticated release
+
+The root =.guix-authorizations= authorizes the full fingerprint
+=4702 823D EED3 1B08 DBB4 9DBC 6BC7 A41A 169B 48DB=.  The
+=.guix-channel= file names the orphan =keyring= branch containing that public
+key, so consumers do not need it in their personal GnuPG keyring.
+
+Before publishing or changing a consumer declaration:
+
+1. Verify the complete signing fingerprint from the actual secret/public key.
+2. Verify the keyring branch contains only its matching armored public key.
+3. Create a signed introductory commit; never rewrite it.
+4. Build and test the release commit on x86_64-linux and aarch64-linux.
+5. Tag the immutable release and record both the release commit and introductory
+   commit in each consumer's channel declaration.
+
+The repository URL must be readable by every machine that runs =guix pull=.
+Do not publish a consumer declaration with placeholders or an unauthenticated
+introduction.
+
+* Checks before release
+
+#+begin_src bash
+ci_root=$(mktemp -d)
+guix pull -C ci/channels.scm -p "$ci_root/guix"
+"$ci_root/guix/bin/guix" build -L modules -f guix.scm
+"$ci_root/guix/bin/guix" lint -n -L modules cl-art
+guix repl -L modules -L . -- tests/package.scm
+bash tests/macos-bootstrap.bash
+#+end_src
+
+Run =art --help= from the built profile on each Linux architecture.  It loads
+the Lisp systems before command dispatch and therefore catches dependency
+discovery failures without opening displays.  A release still requires one
+real fetch and one real multi-display =art show= test.
+
+* Consumer cutover order
+
+1. Add only the pinned, introduced channel to the consumer and run =guix pull=
+   everywhere.
+2. Install =cl-art= alongside the legacy command and test the profile command
+   explicitly.
+3. Remove the legacy command and dependency wiring, then reconfigure the Guix
+   host so its old =~/.local/bin/art= no longer exists.
+4. While guix-sync is idle, run =bash macos/bootstrap= on the Mac.  This installs
+   SBCL and SDL through the Brewfile, preserves or safely installs Quicklisp,
+   pre-loads all six ART systems, preserves the previous command/state as
+   =.before-cl-art= files, and atomically removes only the three SDL formula
+   names from both current and legacy guix-sync state files.  Shared SBCL stays
+   managed by guix-sync.
+5. Run =bash macos/bootstrap --check= before the next =guix-sync all apply=.
+
+The order matters.  A VM still using its legacy Home generation can overwrite
+the newly installed Mac command.  Conversely, deleting the formulae from
+guix-sync's source map before the bootstrap relinquishes its saved ownership
+causes the next apply to uninstall them.
+
+If Quicklisp is not installed, the cutover additionally requires a trusted
+=quicklisp.lisp= and its independently obtained SHA-256 through
+=CL_ART_QUICKLISP_INSTALLER= and =CL_ART_QUICKLISP_INSTALLER_SHA256=.  Do not
+replace those with an unpinned =curl= step.  =--check= is intentionally
+network-free; a missing system is an error, not a reason to fetch during
+validation.
+
+* Rollback
+
+For an immediate Linux rollback, use the previous Guix Home generation.  For a
+durable rollback, restore the consumer's legacy code before removing the
+channel.  On macOS, restore =art.before-cl-art= and the saved brew-managed state
+files.  Once the old Brew map is restored, the next guix-sync apply re-adopts
+the still-installed formulae.  Quicklisp is not deleted or rolled back by this
+procedure because the bootstrap never replaces an existing installation.
