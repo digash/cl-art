@@ -9,6 +9,7 @@
                           sbcl-sdl2-image
                           sbcl-sdl2-ttf
                           sbcl-shasht))
+  #:use-module ((gnu packages sdl) #:select (sdl2))
   #:use-module (guix gexp)
   #:use-module (guix packages)
   #:use-module (guix utils)
@@ -45,13 +46,49 @@
 
 ;; Each SDL wrapper also expands C-INCLUDE while it is being built.  A native
 ;; input on cl-autowrap does not propagate into those separate build
-;; environments, so add c2ffi to each wrapper in dependency order.
+;; environments, so add c2ffi to each wrapper in dependency order.  Delete the
+;; checked-in specs first: the Linux specs shipped by cl-sdl2-image contain
+;; constants and enums but no function declarations, so Autowrap otherwise
+;; accepts them and leaves every IMG_* entry point undefined.  c2ffi must also
+;; search SDL2's nested include directory: SDL_image.h and SDL_ttf.h include
+;; headers such as SDL.h by basename, while Guix exposes them below
+;; include/SDL2.
 (define (with-c2ffi p)
   (package
     (inherit p)
     (native-inputs
      (modify-inputs (package-native-inputs p)
-       (prepend c2ffi)))))
+       (prepend c2ffi sdl2)))
+    (arguments
+     (substitute-keyword-arguments (package-arguments p)
+       ((#:phases phases #~%standard-phases)
+        #~(modify-phases #$phases
+            (add-after 'unpack 'regenerate-autowrap-specs
+              (lambda _
+                ;; Dependency declarations have Guix store paths rather than
+                ;; /usr/include paths.  Keep them out of the generated wrapper;
+                ;; :include-sources in each upstream file retains its own SDL
+                ;; add-on header.
+                (substitute* "src/autowrap.lisp"
+                  (("\"/usr/include/\"")
+                   "\"/usr/include/\" \"/include/\""))
+                (for-each delete-file
+                          (find-files "src/spec" "\\.spec$"))))
+            (add-before 'build 'find-sdl2-headers
+              (lambda _
+                (setenv
+                 "C_INCLUDE_PATH"
+                 (string-append
+                  #$(this-package-native-input "sdl2") "/include/SDL2:"
+                  (or (getenv "C_INCLUDE_PATH") "")))))
+            (add-after 'build 'validate-autowrap-specs
+              (lambda* (#:key outputs #:allow-other-keys)
+                (let ((specs
+                       (find-files (assoc-ref outputs "out") "\\.spec$")))
+                  (unless (pair? specs)
+                    (error "Autowrap generated no specs"))
+                  (apply invoke "grep" "--quiet" "\"tag\": \"function\""
+                         specs))))))))))
 
 (define (with-c2ffi-and-ttf-header p)
   (let ((p (with-c2ffi p)))

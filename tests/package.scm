@@ -96,4 +96,11 @@
        (error "the ART package does not carry its c2ffi repair" name))))
  '("sbcl-cl-autowrap" "sbcl-sdl2-image" "sbcl-sdl2-ttf"))
 
+(for-each
+ (lambda (name)
+   (let ((package (closure-package name)))
+     (unless (member "sdl2" (native-input-names package))
+       (error "the ART SDL wrapper lacks its header input" name))))
+ '("sbcl-sdl2-image" "sbcl-sdl2-ttf"))
+
 (display "cl-art package boundary checks passed\n")
