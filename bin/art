@@ -518,6 +518,9 @@ seen. No time limit: it holds until told to go."
     ;; thread and WITH-INIT simply hangs without it.
     (sdl2:make-this-thread-main
      (lambda ()
+       ;; Off, or macOS gives each :desktop window its own Space and only one
+       ;; display shows its painting; the others stay black.
+       (sdl2:set-hint :video-mac-fullscreen-spaces "0")
        (sdl2:init :video)
        (sdl2-image:init '(:jpg))
        (ignore-errors (sdl2-ttf:init))
