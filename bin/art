@@ -476,8 +476,14 @@ same as visible, and :desktop fullscreen is what puts them above the menu bar."
         collect (let* ((window (sdl2:create-window :x (sdl2:rect-x bounds)
                                                    :y (sdl2:rect-y bounds)
                                                    :w w :h h
-                                                   :flags '(:borderless :shown)))
-                       (renderer (progn (sdl2:set-window-fullscreen window :desktop)
+                                                   :flags (if (uiop:os-macosx-p)
+                                                              '(:borderless :shown)
+                                                              ;; Unmanaged: an X11 window
+                                                              ;; manager would move both
+                                                              ;; onto its current frame.
+                                                              '(:borderless :shown :tooltip))))
+                       (renderer (progn (when (uiop:os-macosx-p)
+                                          (sdl2:set-window-fullscreen window :desktop))
                                         (sdl2:raise-window window)
                                         (sdl2:create-renderer window -1 '(:accelerated)))))
                   ;; Draw in the renderer's own units, not the display's. Bounds
@@ -529,6 +535,13 @@ seen. No time limit: it holds until told to go."
                (length files) (sdl2:get-num-video-displays))
        (finish-output *error-output*)
        (let ((screens (open-screens)))
+         ;; Unmanaged windows get no focus from the window manager, so take the
+         ;; keyboard ourselves -- once they are mapped, or the grab is refused.
+         (unless (uiop:os-macosx-p)
+           (sleep 0.3)
+           (let ((window (getf (first screens) :window)))
+             (sdl2-ffi.functions:sdl-set-window-input-focus window)
+             (sdl2-ffi.functions:sdl-set-window-keyboard-grab window 1)))
          (unwind-protect
               (progn
                 (loop with path = (any-font)
