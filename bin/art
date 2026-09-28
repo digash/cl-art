@@ -574,6 +574,25 @@ seen. No time limit: it holds until told to go."
                         (return-from watch)))
              (sleep 0.1))))
 
+(defun x-focus (&optional window)
+  "The X11 window that has the keyboard, or give it to WINDOW. Only for the
+unmanaged windows below: they take focus themselves, and when they close X
+reverts it to the root or to nothing -- the window manager never learns, and the
+keyboard stays dead until a click. So SHOW notes the holder first and hands it
+back. Straight Xlib because SDL has no call for a window it does not own."
+  (cffi:load-foreign-library "libX11.so.6")
+  (let ((dpy (cffi:foreign-funcall "XOpenDisplay" :pointer (cffi:null-pointer) :pointer)))
+    (unless (cffi:null-pointer-p dpy)
+      (unwind-protect
+           (if window
+               (cffi:foreign-funcall "XSetInputFocus" :pointer dpy :unsigned-long window
+                                     :int 1 :unsigned-long 0 :int) ;RevertToPointerRoot, CurrentTime
+               (cffi:with-foreign-objects ((w :unsigned-long) (revert :int))
+                 (cffi:foreign-funcall "XGetInputFocus" :pointer dpy :pointer w
+                                       :pointer revert :int)
+                 (cffi:mem-ref w :unsigned-long)))
+        (cffi:foreign-funcall "XCloseDisplay" :pointer dpy :int)))))
+
 (defun show (dir)
   (let ((files (images dir)))
     (when (null files)
@@ -592,7 +611,8 @@ seen. No time limit: it holds until told to go."
        (format *error-output* "~&art: ~a image~:p on ~a display~:p~%"
                (length files) (sdl2:get-num-video-displays))
        (finish-output *error-output*)
-       (let ((screens (open-screens)))
+       (let ((focus (unless (uiop:os-macosx-p) (ignore-errors (x-focus))))
+             (screens (open-screens)))
          ;; Unmanaged windows get no focus from the window manager, so take the
          ;; keyboard ourselves -- once they are mapped, or the grab is refused.
          (unless (uiop:os-macosx-p)
@@ -627,7 +647,10 @@ seen. No time limit: it holds until told to go."
            (dolist (screen screens)
              (ignore-errors (sdl2:destroy-window (getf screen :window))))
            (sdl2:show-cursor)
-           (sdl2:quit)))))))
+           (sdl2:quit)
+           ;; 0 and 1 are None and PointerRoot, not windows to hand back to.
+           (when (and focus (> focus 1))
+             (ignore-errors (x-focus focus)))))))))
 
 ;;; ═══════════════════════════════════════════════════════════════════════════
 ;;; cli
