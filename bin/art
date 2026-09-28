@@ -172,7 +172,9 @@ profile's prebuilt fasls."
     ;; are out of copyright: Piranesi's impossible prisons, Dürer's polyhedra and
     ;; perspective, and the Japanese printmakers whose flat interlocking pattern
     ;; he studied directly. 90 to 100 usable works each.
-    "Piranesi" "Dürer" "Hokusai" "Hiroshige" "Kuniyoshi")
+    "Piranesi" "Dürer" "Hokusai" "Hiroshige" "Kuniyoshi"
+    ;; Not at AIC at all; his gesture drawings survive as book plates. See *BOOKS*.
+    "Bridgman")
   "Surnames, matched case-insensitively against AIC's `artist_title': \"Rodin\"
 finds \"Auguste Rodin\", \"Michelangelo\" finds \"Michelangelo Buonarroti\".
 
@@ -351,10 +353,66 @@ us."
     (format t "  ~a new, ~a already present~%" got had)
     (+ got had)))
 
+;;; ═══════════════════════════════════════════════════════════════════════════
+;;; fetch — Internet Archive book plates
+;;; ═══════════════════════════════════════════════════════════════════════════
+;;;
+;;; George Bridgman taught figure drawing at the Art Students League, and what is
+;;; out of copyright is his books: AIC and the Met hold nothing of his. The
+;;; Internet Archive serves any page of a scan as a jpg at a given width, so a
+;;; plate is an (identifier, page) pair.
+;;;
+;;; What is wanted is his gesture drawing -- the figure in motion -- and the free
+;;; scans are thin on it. Life Drawing (1924) is where most of it is, but the only
+;;; copies there are later printings, access-restricted. Constructive Anatomy
+;;; (1920) is open and mostly parts: hands, heads, limbs. The pages below are the
+;;; ones that are whole figures or the torso twisting, picked by eye.
+
+(defparameter *books*
+  '(("Bridgman"
+     ("cu31924014504371" "Constructive Anatomy" "1920"
+      (16 18 20 172 174 176))))
+  "Artist → (IA identifier, title, year, scan pages from 0) for artists whose work
+is book plates.")
+
+(defparameter *ia* "https://archive.org/download")
+
+(defun fetch-book (artist book dir)
+  "The listed pages of BOOK into DIR/ARTIST; returns how many are there."
+  (destructuring-bind (id title year pages) book
+    (let ((target (format nil "~a/~a" dir artist))
+          (got 0)
+          (had 0))
+      (ensure-directories-exist (format nil "~a/" target))
+      (format t "~&~a — ~a~%" artist title)
+      (dolist (n pages)
+        (let ((path (format nil "~a/~a p~a-~a.jpg" target title (1+ n) n)))
+          (cond ((probe-file path) (incf had))
+                (t (with-open-file (out path :direction :output
+                                             :element-type '(unsigned-byte 8)
+                                             :if-exists :supersede)
+                     (write-sequence (dex:get (format nil "~a/~a/page/n~a_w~a.jpg"
+                                                      *ia* id n *width*)
+                                              :force-binary t)
+                                     out))
+                   (with-open-file (out (date-path path) :direction :output
+                                                         :if-exists :supersede)
+                     (write-string year out))
+                   (incf got)
+                   (sleep 1/2)
+                   (format t "  + ~a~%" (file-namestring path))))))
+      (format t "  ~a new, ~a already present~%" got had)
+      (+ got had))))
+
 (defun fetch (artists dir limit)
   (let ((total 0))
     (handler-case (dolist (artist artists)
-                    (incf total (fetch-artist artist dir limit)))
+                    (incf total
+                          (let ((books (cdr (assoc artist *books* :test #'string-equal))))
+                            (if books
+                                (loop for book in books
+                                      sum (fetch-book artist book dir))
+                                (fetch-artist artist dir limit)))))
       (throttled ()
         (format t "~&  AIC is refusing images (403) -- rate limited.~%~
                      Everything downloaded so far is kept; run `art fetch' again~%~
@@ -579,7 +637,8 @@ seen. No time limit: it holds until told to go."
   (format t "usage: art [fetch|show] [options]
 
   art fetch [ARTIST...] [--limit N]   download public-domain works from the
-                                      Art Institute of Chicago
+                                      Art Institute of Chicago (Bridgman's gesture
+                                      plates from the Internet Archive)
   art show                            a still on every display, until a keypress
                                       or a mouse move
   art                                 show, fetching first if ART_DIR is empty
