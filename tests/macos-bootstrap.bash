@@ -236,7 +236,7 @@ cmp -s -- "$test_root/missing.original" "$missing_state"
 for system in :dexador :shasht :quri :sdl2 :sdl2-image :sdl2-ttf; do
   grep -Fq -- "$system" "$repo_root/macos/quicklisp-systems.lisp"
 done
-for formula in sbcl sdl2-compat sdl2_image sdl2_ttf; do
+for formula in sbcl poppler sdl2-compat sdl2_image sdl2_ttf; do
   grep -Fqx -- "brew \"$formula\"" "$repo_root/macos/Brewfile"
 done
 

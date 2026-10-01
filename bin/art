@@ -367,6 +367,8 @@ us."
 ;;; copies there are later printings, access-restricted. Constructive Anatomy
 ;;; (1920) is open and mostly parts: hands, heads, limbs. The pages below are the
 ;;; ones that are whole figures or the torso twisting, picked by eye.
+;;; A downloadable Life Drawing scan is mirrored by Dogtown Sculptors; see
+;;; docs/bridgman-gestures.org for the source and selected figure plates.
 
 (defparameter *books*
   '(("Bridgman"
@@ -376,6 +378,62 @@ us."
 is book plates.")
 
 (defparameter *ia* "https://archive.org/download")
+
+(defparameter *pdf-books*
+  '(("Bridgman"
+     ("Life Drawing" "1924"
+      "https://dogtownsculptors.org/wp-content/uploads/2019/11/bridgmans-life-drawing-bridgman-george-brant-1864-1943.pdf"
+      (16 21 22 23 26 27 29 32 33 34 35 38 40 42 45 48 49 50 51 52 53 54 55 60))))
+  "Artist → (title, year, PDF URL, one-based PDF pages). This scan's printed
+page numbers are two less than its PDF pages.")
+
+(defun fetch-pdf-book (artist book dir)
+  "Render missing gesture plates, downloading the PDF only when needed."
+  (destructuring-bind (title year url pages) book
+    (let* ((target (uiop:ensure-directory-pathname (format nil "~a/~a/" dir artist)))
+           (missing nil)
+           (had 0))
+      (ensure-directories-exist target)
+      (format t "~&~a — ~a~%" artist title)
+      (dolist (page pages)
+        (let ((path (merge-pathnames
+                     (format nil "~a p~a-~a.jpg" title (- page 2) (1- page)) target)))
+          (if (probe-file path)
+              (incf had)
+              (push (cons page path) missing))))
+      (when missing
+        ;; Fail before downloading if the renderer is missing. Guix pins its
+        ;; absolute path; native installations find Homebrew's Poppler on PATH.
+        (let ((renderer (or (uiop:getenv "CL_ART_PDFTOPPM") "pdftoppm")))
+          (handler-case (uiop:run-program (list renderer "-v")
+                                         :output nil :error-output nil)
+            (error () (error "pdftoppm is required: install Poppler (macOS: brew install poppler).")))
+          (uiop:with-temporary-file (:stream out :pathname pdf :type "pdf"
+                                    :element-type '(unsigned-byte 8))
+            (write-sequence (dex:get url :force-binary t) out)
+            :close-stream
+            (dolist (entry (nreverse missing))
+              (let ((page (write-to-string (car entry))) (path (cdr entry)))
+                ;; Render beside the destination and publish only on success.
+                ;; A failed conversion must not leave an apparently cached JPG.
+                (uiop:with-temporary-file (:pathname plate :directory target :type "jpg")
+                  (uiop:run-program
+                   (list renderer "-f" page "-l" page "-singlefile"
+                         "-scale-to" "2400" "-jpeg" "-jpegopt" "quality=95"
+                         (namestring pdf)
+                         (namestring (make-pathname :type nil :defaults plate)))
+                   :output *standard-output* :error-output *error-output*)
+                  (with-open-file (image plate :element-type '(unsigned-byte 8))
+                    (unless (and (> (file-length image) 2)
+                                 (= (read-byte image) #xff) (= (read-byte image) #xd8))
+                      (error "Renderer did not produce a JPEG for page ~a" page)))
+                  (with-open-file (date (date-path path) :direction :output
+                                                           :if-exists :supersede)
+                    (write-string year date))
+                  (uiop:rename-file-overwriting-target plate path))
+                (format t "  + ~a~%" (file-namestring path)))))))
+      (format t "  ~a new, ~a already present~%" (- (length pages) had) had)
+      (length pages))))
 
 (defun fetch-book (artist book dir)
   "The listed pages of BOOK into DIR/ARTIST; returns how many are there."
@@ -408,10 +466,11 @@ is book plates.")
   (let ((total 0))
     (handler-case (dolist (artist artists)
                     (incf total
-                          (let ((books (cdr (assoc artist *books* :test #'string-equal))))
-                            (if books
-                                (loop for book in books
-                                      sum (fetch-book artist book dir))
+                          (let ((books (cdr (assoc artist *books* :test #'string-equal)))
+                                (pdfs (cdr (assoc artist *pdf-books* :test #'string-equal))))
+                            (if (or books pdfs)
+                                (+ (loop for book in books sum (fetch-book artist book dir))
+                                   (loop for book in pdfs sum (fetch-pdf-book artist book dir)))
                                 (fetch-artist artist dir limit)))))
       (throttled ()
         (format t "~&  AIC is refusing images (403) -- rate limited.~%~
@@ -661,7 +720,7 @@ back. Straight Xlib because SDL has no call for a window it does not own."
 
   art fetch [ARTIST...] [--limit N]   download public-domain works from the
                                       Art Institute of Chicago (Bridgman's gesture
-                                      plates from the Internet Archive)
+                                      plates from Internet Archive and Life Drawing)
   art show                            a still on every display, until a keypress
                                       or a mouse move
   art                                 show, fetching first if ART_DIR is empty

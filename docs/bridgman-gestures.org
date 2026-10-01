@@ -1,0 +1,28 @@
+#+title: Bridgman gesture plates
+
+* Source and selection
+
+George B. Bridgman's /Life Drawing/ (copyright 1924), fifth printing (1943),
+is available as a [[https://dogtownsculptors.org/wp-content/uploads/2019/11/bridgmans-life-drawing-bridgman-george-brant-1864-1943.pdf][PDF from Dogtown Sculptors]]. The copyright and printing dates
+appear on PDF page 6. This mirror supplies the scan independently of the
+restricted Internet Archive reader.
+
+These 24 PDF pages were visually checked for whole-figure gesture, balance,
+rhythm, and twisting: 16, 21, 22, 23, 26, 27, 29, 32, 33, 34, 35, 38, 40,
+42, 45, 48, 49, 50, 51, 52, 53, 54, 55, 60. Printed page numbers are two
+less than PDF page numbers. The original scan's paper tone is preserved.
+
+* Fetch
+
+Run =art fetch Bridgman=. It fetches the six Internet Archive plates and
+these 24 gesture plates, skipping existing files. A partially completed run
+resumes at the missing plates; a complete collection needs no PDF download.
+The filename and date sidecar match the earlier manual imports.
+
+The PDF is downloaded once per fetch that needs gesture plates, rendered to
+2400-pixel JPEGs with Poppler, and removed afterward. Each JPEG is staged
+before being renamed into place, so failed conversions can be retried.
+
+Guix includes Poppler in the launcher closure. On macOS, run
+=bash macos/bootstrap= to install the updated Brewfile. Other native setups
+need =pdftoppm= on PATH, or =CL_ART_PDFTOPPM= set to its executable path.

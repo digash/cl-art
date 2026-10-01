@@ -23,6 +23,7 @@ install_art=1
 
 required_formulae=(
   sbcl
+  poppler
   sdl2-compat
   sdl2_image
   sdl2_ttf

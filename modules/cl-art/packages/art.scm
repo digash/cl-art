@@ -2,6 +2,7 @@
   #:use-module (cl-art packages lisp)
   #:use-module ((gnu packages bash) #:select (bash-minimal))
   #:use-module ((gnu packages lisp) #:select (sbcl))
+  #:use-module ((gnu packages pdf) #:select (poppler))
   #:use-module (guix build-system copy)
   #:use-module (guix gexp)
   #:use-module ((guix licenses) #:prefix license:)
@@ -58,6 +59,8 @@
                 (call-with-output-file launcher
                   (lambda (port)
                     (format port "#!~a/bin/bash\n" #$bash-minimal)
+                    (format port "export CL_ART_PDFTOPPM=~a/bin/pdftoppm\n"
+                            #$poppler)
                     (format port
                             (string-append
                              "exec ~a/bin/sbcl --dynamic-space-size 4096 "

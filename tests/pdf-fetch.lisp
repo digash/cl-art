@@ -1,0 +1,51 @@
+;;;; Run from the repo root with PDF_TEST_DIR set to an empty temporary directory
+;;;; and CL_ART_PDFTOPPM to a filename inside it. No network or app dependencies.
+(require :asdf)
+(defpackage :dex (:use :cl) (:shadow :get) (:export :get))
+(defvar *downloads* 0)
+(defun dex:get (url &key force-binary)
+  (declare (ignore url force-binary))
+  (incf *downloads*)
+  #(37 80 68 70))
+
+;; Load only the production PDF fetcher and its pathname helper.
+(with-open-file (in "bin/art")
+  (loop for position = (file-position in)
+        for line = (read-line in nil nil) while line
+        when (or (uiop:string-prefix-p "(defun date-path " line)
+                 (uiop:string-prefix-p "(defun fetch-pdf-book " line))
+          do (file-position in position) (eval (read in))))
+
+(let* ((root (uiop:ensure-directory-pathname (uiop:getenv "PDF_TEST_DIR")))
+       (renderer (uiop:getenv "CL_ART_PDFTOPPM"))
+       (book '("Life Drawing" "1924" "unused" (16 21)))
+       (first (merge-pathnames "Bridgman/Life Drawing p14-15.jpg" root))
+       (second (merge-pathnames "Bridgman/Life Drawing p19-20.jpg" root)))
+  (labels ((renderer (fail)
+             (with-open-file (out renderer :direction :output :if-exists :supersede)
+               (format out "#!/bin/sh~%[ \"$1\" = -v ] && exit 0~%for last do :; done~%")
+               (format out "printf '\\377\\330\\377\\331' > \"$last.jpg\"~%exit ~d~%"
+                       (if fail 1 0)))
+             (uiop:run-program (list "chmod" "+x" renderer))))
+    (renderer t)
+    (assert (handler-case (progn (fetch-pdf-book "Bridgman" book root) nil)
+              (error () t)))
+    (assert (not (probe-file first)))
+    (assert (null (uiop:directory-files (merge-pathnames "Bridgman/" root))))
+    (renderer nil)
+    (assert (= 2 (fetch-pdf-book "Bridgman" book root)))
+    (assert (= 2 *downloads*))
+    (assert (string= "1924" (uiop:read-file-string (date-path first))))
+    ;; Cached runs need neither the network nor the renderer.
+    (delete-file renderer)
+    (assert (= 2 (fetch-pdf-book "Bridgman" book root)))
+    (assert (= 2 *downloads*))
+    ;; Partial collections fetch only their missing plate.
+    (delete-file second)
+    (renderer nil)
+    (let ((stamp (file-write-date first)))
+      (assert (= 2 (fetch-pdf-book "Bridgman" book root)))
+      (assert (= stamp (file-write-date first))))
+    (assert (= 3 *downloads*))
+    (assert (probe-file second))))
+(format t "PDF fetch regression checks passed~%")

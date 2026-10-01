@@ -5,6 +5,14 @@ shows one still image per display.  This repository is also a GNU Guix channel:
 it owns the application package, its full Common Lisp dependency closure, and
 the package repairs needed by the SDL bindings.
 
+=art fetch Bridgman= downloads six /Constructive Anatomy/ plates and 24
+/Life Drawing/ gesture plates. The latter come from a PDF mirrored by Dogtown
+Sculptors, rendered with Poppler. Existing images are reused; if all gesture
+plates exist, their PDF is not downloaded. See =docs/bridgman-gestures.org= for
+the source and page selection. Guix supplies the renderer, and the macOS
+Brewfile installs =poppler=. Native runs may override its location with
+=CL_ART_PDFTOPPM=.
+
 * Layout
 
 - =bin/art=: portable SBCL command.
@@ -35,6 +43,15 @@ The lint run is network-free and includes the license checker.
 Run the build natively on both x86_64-linux and aarch64-linux.  Public Guix
 substitute servers will not normally have the repaired derivations.
 
+The PDF fetch regression check runs offline with a fake renderer:
+
+#+begin_src bash
+pdf_test_root=$(mktemp -d)
+PDF_TEST_DIR="$pdf_test_root" CL_ART_PDFTOPPM="$pdf_test_root/renderer" \
+  sbcl --script tests/pdf-fetch.lisp
+rm -rf "$pdf_test_root"
+#+end_src
+
 * macOS
 
 Do not run guix-sync concurrently with the handoff.
@@ -44,8 +61,8 @@ bash macos/bootstrap
 bash macos/bootstrap --check
 #+end_src
 
-The bootstrap installs =bin/art= at =~/.local/bin/art=, installs SBCL and the
-native SDL libraries from the Brewfile, ensures =~/quicklisp/setup.lisp= exists,
+The bootstrap installs =bin/art= at =~/.local/bin/art=, installs SBCL, Poppler,
+and the native SDL libraries from the Brewfile, ensures =~/quicklisp/setup.lisp= exists,
 and pre-loads Dexador, Shasht, QURI, SDL2, SDL2-image, and SDL2-ttf.  Existing
 Quicklisp installations are reused and never replaced or updated.
 
